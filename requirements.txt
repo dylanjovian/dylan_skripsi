@@ -1,2 +1,8 @@
 streamlit
+torch
+transformers
+numpy
 pandas
+scikit-learn
+sentencepiece
+safetensors
