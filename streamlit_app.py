@@ -1,151 +1,179 @@
+import os
+import re
+import torch
+import torch.nn as nn
 import streamlit as st
-import pandas as pd
-import math
-from pathlib import Path
+from transformers import AutoTokenizer, AutoModel
 
-# Set the title and favicon that appear in the Browser's tab bar.
-st.set_page_config(
-    page_title='GDP dashboard',
-    page_icon=':earth_americas:', # This is an emoji shortcode. Could be a URL too.
-)
+# =====================================================
+# KONFIGURASI
+# =====================================================
 
-# -----------------------------------------------------------------------------
-# Declare some useful functions.
+MODEL_NAME = "indobenchmark/indobert-base-p1"
+MAX_LEN = 128
 
-@st.cache_data
-def get_gdp_data():
-    """Grab GDP data from a CSV file.
-
-    This uses caching to avoid having to read the file every time. If we were
-    reading from an HTTP endpoint instead of a file, it's a good idea to set
-    a maximum age to the cache with the TTL argument: @st.cache_data(ttl='1d')
-    """
-
-    # Instead of a CSV on disk, you could read from an HTTP endpoint here too.
-    DATA_FILENAME = Path(__file__).parent/'data/gdp_data.csv'
-    raw_gdp_df = pd.read_csv(DATA_FILENAME)
-
-    MIN_YEAR = 1960
-    MAX_YEAR = 2022
-
-    # The data above has columns like:
-    # - Country Name
-    # - Country Code
-    # - [Stuff I don't care about]
-    # - GDP for 1960
-    # - GDP for 1961
-    # - GDP for 1962
-    # - ...
-    # - GDP for 2022
-    #
-    # ...but I want this instead:
-    # - Country Name
-    # - Country Code
-    # - Year
-    # - GDP
-    #
-    # So let's pivot all those year-columns into two: Year and GDP
-    gdp_df = raw_gdp_df.melt(
-        ['Country Code'],
-        [str(x) for x in range(MIN_YEAR, MAX_YEAR + 1)],
-        'Year',
-        'GDP',
-    )
-
-    # Convert years from string to integers
-    gdp_df['Year'] = pd.to_numeric(gdp_df['Year'])
-
-    return gdp_df
-
-gdp_df = get_gdp_data()
-
-# -----------------------------------------------------------------------------
-# Draw the actual page
-
-# Set the title that appears at the top of the page.
-'''
-# :earth_americas: GDP dashboard
-
-Browse GDP data from the [World Bank Open Data](https://data.worldbank.org/) website. As you'll
-notice, the data only goes to 2022 right now, and datapoints for certain years are often missing.
-But it's otherwise a great (and did I mention _free_?) source of data.
-'''
-
-# Add some spacing
-''
-''
-
-min_value = gdp_df['Year'].min()
-max_value = gdp_df['Year'].max()
-
-from_year, to_year = st.slider(
-    'Which years are you interested in?',
-    min_value=min_value,
-    max_value=max_value,
-    value=[min_value, max_value])
-
-countries = gdp_df['Country Code'].unique()
-
-if not len(countries):
-    st.warning("Select at least one country")
-
-selected_countries = st.multiselect(
-    'Which countries would you like to view?',
-    countries,
-    ['DEU', 'FRA', 'GBR', 'BRA', 'MEX', 'JPN'])
-
-''
-''
-''
-
-# Filter the data
-filtered_gdp_df = gdp_df[
-    (gdp_df['Country Code'].isin(selected_countries))
-    & (gdp_df['Year'] <= to_year)
-    & (from_year <= gdp_df['Year'])
+LABELS = [
+    "APLIKASI_POSITIF",
+    "APLIKASI_NEGATIF",
+    "INTERFACE_POSITIF",
+    "INTERFACE_NEGATIF",
+    "LAYANAN_POSITIF",
+    "LAYANAN_NEGATIF",
+    "KEAMANAN_POSITIF",
+    "KEAMANAN_NEGATIF"
 ]
 
-st.header('GDP over time', divider='gray')
+# =====================================================
+# PATH MODEL
+# =====================================================
 
-''
+POSSIBLE_MODEL_PATHS = [
+    "best_model_indobert.pt",
+    "./best_model_indobert.pt",
+    "/content/drive/MyDrive/Dataset/Skripsi/skenario_7/best_model_indobert.pt"
+]
 
-st.line_chart(
-    filtered_gdp_df,
-    x='Year',
-    y='GDP',
-    color='Country Code',
+MODEL_PATH = None
+for path in POSSIBLE_MODEL_PATHS:
+    if os.path.exists(path):
+        MODEL_PATH = path
+        break
+
+# =====================================================
+# PREPROCESSING
+# =====================================================
+
+def preprocess(text):
+    text = str(text).lower()
+    text = re.sub(r"http\S+|www\S+", "", text)
+    text = re.sub(r"@\w+|#\w+", "", text)
+    text = re.sub(r"\d+", "", text)
+    text = re.sub(r"[^a-zA-Z\s]", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+# =====================================================
+# MODEL INDOBERT
+# =====================================================
+
+class IndoBERTClassifier(nn.Module):
+    def __init__(self, n_classes):
+        super().__init__()
+        self.bert = AutoModel.from_pretrained(MODEL_NAME)
+        self.dropout = nn.Dropout(0.3)
+        self.fc = nn.Linear(self.bert.config.hidden_size, n_classes)
+
+    def forward(self, input_ids, attention_mask):
+        outputs = self.bert(input_ids=input_ids, attention_mask=attention_mask)
+        pooled_output = outputs.last_hidden_state[:, 0]
+        pooled_output = self.dropout(pooled_output)
+        logits = self.fc(pooled_output)
+        return logits
+
+# =====================================================
+# LOAD MODEL
+# =====================================================
+
+@st.cache_resource
+def load_model():
+    if MODEL_PATH is None:
+        raise FileNotFoundError(
+            """
+            File model tidak ditemukan.
+
+            Pastikan file:
+            best_model_indobert.pt
+
+            berada dalam folder project
+            atau Google Drive yang sesuai.
+            """
+        )
+
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+    model = IndoBERTClassifier(len(LABELS))
+    state_dict = torch.load(MODEL_PATH, map_location=torch.device("cpu"))
+    model.load_state_dict(state_dict)
+    model.eval()
+    return tokenizer, model
+
+# =====================================================
+# PREDIKSI
+# =====================================================
+
+def predict(text, tokenizer, model):
+    text = preprocess(text)
+    encoding = tokenizer(
+        text,
+        max_length=MAX_LEN,
+        padding="max_length",
+        truncation=True,
+        return_tensors="pt"
+    )
+
+    with torch.no_grad():
+        logits = model(
+            encoding["input_ids"],
+            encoding["attention_mask"]
+        )
+        probabilities = torch.sigmoid(logits).squeeze()
+
+    return probabilities.cpu().numpy()
+
+# =====================================================
+# STREAMLIT UI
+# =====================================================
+
+st.set_page_config(
+    page_title="Analisis Sentimen Multi Label",
+    page_icon=":bar_chart:",
+    layout="wide"
 )
 
-''
-''
+st.title("Analisis Sentimen Multi Label IndoBERT")
 
+st.markdown(
+    """
+    Aplikasi ini menggunakan model IndoBERT
+    untuk mendeteksi sentimen berdasarkan aspek:
 
-first_year = gdp_df[gdp_df['Year'] == from_year]
-last_year = gdp_df[gdp_df['Year'] == to_year]
+    - Aplikasi
+    - Interface
+    - Layanan
+    - Keamanan
+    """
+)
 
-st.header(f'GDP in {to_year}', divider='gray')
+try:
+    tokenizer, model = load_model()
+    st.success(f"Model berhasil dimuat dari:\n{MODEL_PATH}")
+except Exception as e:
+    st.error(f"Gagal memuat model:\n{e}")
+    st.stop()
 
-''
+review = st.text_area(
+    "Masukkan ulasan pengguna",
+    height=200,
+    placeholder="Contoh: Aplikasi sangat membantu tetapi tampilannya masih kurang menarik."
+)
 
-cols = st.columns(4)
+threshold = st.slider(
+    "Threshold Prediksi",
+    min_value=0.1,
+    max_value=0.9,
+    value=0.5,
+    step=0.05
+)
 
-for i, country in enumerate(selected_countries):
-    col = cols[i % len(cols)]
+if st.button("Prediksi"):
+    if review.strip() == "":
+        st.warning("Masukkan ulasan terlebih dahulu.")
+        st.stop()
 
-    with col:
-        first_gdp = first_year[first_year['Country Code'] == country]['GDP'].iat[0] / 1000000000
-        last_gdp = last_year[last_year['Country Code'] == country]['GDP'].iat[0] / 1000000000
+    probs = predict(review, tokenizer, model)
+    st.subheader("Hasil Prediksi")
 
-        if math.isnan(first_gdp):
-            growth = 'n/a'
-            delta_color = 'off'
-        else:
-            growth = f'{last_gdp / first_gdp:,.2f}x'
-            delta_color = 'normal'
-
-        st.metric(
-            label=f'{country} GDP',
-            value=f'{last_gdp:,.0f}B',
-            delta=growth,
-            delta_color=delta_color
-        )
+    for label, prob in zip(LABELS, probs):
+        prediction = "✅ Positif/Terdeteksi" if prob > threshold else "❌ Tidak Terdeteksi"
+        st.write(f"**{label}** : {prediction}")
+        st.progress(float(prob))
+        st.caption(f"Probabilitas: {prob:.4f}")
